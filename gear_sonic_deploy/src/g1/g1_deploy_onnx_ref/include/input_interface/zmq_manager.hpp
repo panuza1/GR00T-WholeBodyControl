@@ -179,6 +179,10 @@ class ZMQManager : public InputInterface {
             report_temperature_flag_ = true;
             is_manager_key = true;
             break;
+          case ']':
+            start_control_ = true;
+            is_manager_key = true;
+            break;
           // Global compliance controls - work across ALL modes
           case 'g':
           case 'G':
@@ -358,6 +362,10 @@ class ZMQManager : public InputInterface {
         
         // Clear hand joints control state
         has_hand_joints_ = false;
+      }
+
+      if (active_mode_ == ManagedMode::STREAMED_MOTION && start_control_) {
+        operator_state.start = true;
       }
 
       // Delegate based on current mode

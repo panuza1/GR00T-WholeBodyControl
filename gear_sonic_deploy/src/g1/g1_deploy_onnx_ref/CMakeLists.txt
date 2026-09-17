@@ -176,6 +176,7 @@ find_package(Eigen3 REQUIRED)
 set(EXE_INCLUDES
   ${CMAKE_CURRENT_SOURCE_DIR}/include/
   ${ZMQ_INCLUDE_DIR}
+  ${MSGPACK_INCLUDE_DIR}
   ${EIGEN3_INCLUDE_DIR}
 )
 
@@ -189,16 +190,21 @@ set(EXE_LIBS
   g1_deploy_shared
   audio_thread
   unitree_sdk2 ZLIB::ZLIB
-  onnxruntime::onnxruntime TRTInference
-  CUDA::cudart
-  ${TensorRT_nvinfer_LIBRARY} ${TensorRT_nvonnxparser_LIBRARY}
-  ${CUDLA_LIBRARY}
+  onnxruntime::onnxruntime
   ${ZMQ_LIBRARY}
 )
+if(NOT SONIC_SIM_ORT)
+  list(APPEND EXE_LIBS TRTInference CUDA::cudart
+    ${TensorRT_nvinfer_LIBRARY} ${TensorRT_nvonnxparser_LIBRARY} ${CUDLA_LIBRARY})
+endif()
 
 
 # build the main executable:
 add_executable(${EXECUTABLE_NAME} ${CMAKE_CURRENT_SOURCE_DIR}/src/g1_deploy_onnx_ref.cpp)
+if(SONIC_SIM_ORT)
+  target_compile_definitions(${EXECUTABLE_NAME} PRIVATE SONIC_SIM_ORT=1)
+  target_compile_options(${EXECUTABLE_NAME} PRIVATE -fno-fast-math)
+endif()
 target_include_directories(${EXECUTABLE_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/ ${PROJECT_SOURCE_DIR}/src)
 
 target_link_directories(${EXECUTABLE_NAME} PRIVATE ${CUDA_LINK_DIRS})

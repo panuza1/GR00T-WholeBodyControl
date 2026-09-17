@@ -132,6 +132,7 @@ class UnitreeSdk2Bridge:
     def reset(self):
         with self.low_cmd_lock:
             self.low_cmd_received = False
+            self.policy_started = False
             self.new_low_cmd = False
         with self.left_hand_cmd_lock:
             self.left_hand_cmd_received = False
@@ -144,6 +145,7 @@ class UnitreeSdk2Bridge:
         with self.low_cmd_lock:
             self.low_cmd = msg
             self.low_cmd_received = True
+            self.policy_started = msg.mode_pr == 42
             self.new_low_cmd = True
 
     def LeftHandCmdHandler(self, msg):

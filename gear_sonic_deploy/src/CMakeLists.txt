@@ -1,3 +1,5 @@
-add_subdirectory(TRTInference)
+if(NOT SONIC_SIM_ORT)
+  add_subdirectory(TRTInference)
+endif()
 add_subdirectory(g1)
 add_subdirectory(audio_thread)

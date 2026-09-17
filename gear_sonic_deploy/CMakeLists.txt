@@ -22,12 +22,16 @@ include(CheckLanguage)
 
 # Optional builds
 option(BUILD_SRCS "Build sources" ON)
+option(SONIC_SIM_ORT "Build the loopback-only ONNX Runtime simulation backend" OFF)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-find_package(TensorRT REQUIRED)
+if(NOT SONIC_SIM_ORT)
+  find_package(TensorRT REQUIRED)
+endif()
 find_package(Threads REQUIRED)
 find_package(onnxruntime REQUIRED)
+if(NOT SONIC_SIM_ORT)
 # Find CUDA Toolkit with proper environment variable support
 if(DEFINED ENV{CUDAToolkit_ROOT})
     set(CUDAToolkit_ROOT $ENV{CUDAToolkit_ROOT})
@@ -222,6 +226,7 @@ else()
    - Run 'ls -la /usr/local/cuda*' to verify CUDA installation")
     endif()
 endif()
+endif() # NOT SONIC_SIM_ORT
 find_package(ZLIB REQUIRED)
 
 # Use local unitree_sdk2 subfolder

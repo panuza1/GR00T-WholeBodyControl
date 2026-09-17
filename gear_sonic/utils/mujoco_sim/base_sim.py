@@ -60,6 +60,9 @@ class DefaultEnv:
         self.reward_lock = Lock()
         self.unitree_bridge = None
         self.onscreen = onscreen
+        self.elastic_band = None
+        self._last_safety_reset_reason = None
+        self.safety_reset_count = 0
 
         self.init_scene()
         self.last_reward = 0
@@ -247,6 +250,34 @@ class DefaultEnv:
         self.left_hand_index = np.array(self.left_hand_index)
         self.right_hand_index = np.array(self.right_hand_index)
 
+        # The model interleaves the left hand between the two arm groups.  Use
+        # the model's joint addresses rather than assuming qpos[7:] is the
+        # 29-motor order.
+        self.body_qpos_index = self.body_joint_index + self.qpos_offset - 1
+        self.body_qvel_index = self.body_joint_index + self.qvel_offset - 1
+        self.left_hand_qpos_index = self.left_hand_index + self.qpos_offset - 1
+        self.left_hand_qvel_index = self.left_hand_index + self.qvel_offset - 1
+        self.right_hand_qpos_index = self.right_hand_index + self.qpos_offset - 1
+        self.right_hand_qvel_index = self.right_hand_index + self.qvel_offset - 1
+
+        self._reset_qpos()
+
+    def _reset_qpos(self):
+        """Reset to the configured neutral pose, including the floating root."""
+        mujoco.mj_resetData(self.mj_model, self.mj_data)
+        default_angles = np.asarray(self.robot.DEFAULT_DOF_ANGLES, dtype=float)
+        if default_angles.size != self.body_qpos_index.size:
+            raise ValueError(
+                f"DEFAULT_DOF_ANGLES has {default_angles.size} values, "
+                f"expected {self.body_qpos_index.size}"
+            )
+        if not np.all(np.isfinite(default_angles)):
+            raise ValueError("DEFAULT_DOF_ANGLES contains non-finite values")
+        self.mj_data.qpos[self.body_qpos_index] = default_angles
+        self.mj_data.qpos[self.left_hand_qpos_index] = 0.0
+        self.mj_data.qpos[self.right_hand_qpos_index] = 0.0
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+
     def init_renderers(self):
         self.renderers = {}
         for camera_name, camera_config in self.camera_configs.items():
@@ -370,25 +401,34 @@ class DefaultEnv:
         )
         obs["secondary_imu_vel"] = pose[7:13]
 
-        obs["body_q"] = self.mj_data.qpos[self.body_joint_index + 7 - 1]
-        obs["body_dq"] = self.mj_data.qvel[self.body_joint_index + 6 - 1]
-        obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
+        obs["body_q"] = self.mj_data.qpos[self.body_qpos_index]
+        obs["body_dq"] = self.mj_data.qvel[self.body_qvel_index]
+        obs["body_ddq"] = self.mj_data.qacc[self.body_qvel_index]
         obs["body_tau_est"] = self.mj_data.actuator_force[self.body_joint_index - 1]
         if self.num_hand_dof > 0:
-            obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_index + self.qpos_offset - 1]
-            obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_index + self.qvel_offset - 1]
-            obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_index + self.qvel_offset - 1]
+            obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_qpos_index]
+            obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_qvel_index]
+            obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_qvel_index]
             obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_index - 1]
-            obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_index + self.qpos_offset - 1]
-            obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_index + self.qvel_offset - 1]
-            obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + self.qvel_offset - 1]
+            obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_qpos_index]
+            obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_qvel_index]
+            obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_qvel_index]
             obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_index - 1]
         obs["time"] = self.mj_data.time
         return obs
 
     def sim_step(self):
+        self.check_fall()
+        if self.fall:
+            return
         self.obs = self.prepare_obs()
         self.unitree_bridge.PublishLowState(self.obs)
+        # Publish the initial state, but do not let the free base fall while the
+        # external controller is loading models and waiting for operator start.
+        if not self.unitree_bridge.low_cmd_received:
+            return
+        if self.config.get("WAIT_FOR_POLICY_START", False) and not self.unitree_bridge.policy_started:
+            return
         if self.unitree_bridge.joystick:
             self.unitree_bridge.PublishWirelessController()
         if self.elastic_band:
@@ -414,6 +454,9 @@ class DefaultEnv:
                 self.mj_data.xfrc_applied[self.band_attached_link] = np.zeros(6)
         body_torques = self.compute_body_torques()
         hand_torques = self.compute_hand_torques()
+        if not np.all(np.isfinite(body_torques)) or not np.all(np.isfinite(hand_torques)):
+            self._safe_reset("non-finite torque")
+            return
         # -1: actuator array is 0-based while joint indices from the model are 1-based
         self.torques[self.body_joint_index - 1] = body_torques
         if self.num_hand_dof > 0:
@@ -507,12 +550,34 @@ class DefaultEnv:
 
     def check_fall(self):
         self.fall = False
+        if not np.all(np.isfinite(self.mj_data.qpos)) or not np.all(np.isfinite(self.mj_data.qvel)):
+            self._safe_reset("non-finite state")
+            return
+        for joint_id in range(1, self.mj_model.njnt):
+            if self.mj_model.jnt_limited[joint_id]:
+                qpos = self.mj_data.qpos[self.mj_model.jnt_qposadr[joint_id]]
+                low, high = self.mj_model.jnt_range[joint_id]
+                if qpos < low - 0.05 or qpos > high + 0.05:
+                    name = self.mj_model.joint(joint_id).name
+                    qvel = self.mj_data.qvel[self.mj_model.jnt_dofadr[joint_id]]
+                    torque = self.mj_data.actuator_force[joint_id - 1]
+                    self._safe_reset(
+                        f"joint limit {name}: {qpos:.3f} outside [{low:.3f}, {high:.3f}], "
+                        f"dq={qvel:.3f}, tau={torque:.3f}"
+                    )
+                    return
         if self.mj_data.qpos[2] < 0.2:
             self.fall = True
-            print(f"Warning: Robot has fallen, height: {self.mj_data.qpos[2]:.3f} m")
+            self._safe_reset(f"fallen ({self.mj_data.qpos[2]:.3f} m)")
 
-        if self.fall:
-            self.reset()
+    def _safe_reset(self, reason):
+        self.safety_reset_count += 1
+        if self.safety_reset_count <= 10 or self.safety_reset_count % 100 == 0:
+            print(f"Warning: simulation safety reset: {reason}")
+            self._last_safety_reset_reason = reason
+        self.fall = True
+        self.torques.fill(0.0)
+        self._reset_qpos()
 
     def check_self_collision(self):
         robot_bodies = get_subtree_body_names(self.mj_model, self.mj_model.body(self.root_body).id)
@@ -524,7 +589,7 @@ class DefaultEnv:
         return self_collision
 
     def reset(self):
-        mujoco.mj_resetData(self.mj_model, self.mj_data)
+        self._reset_qpos()
 
 
 class BaseSimulator:
@@ -559,13 +624,10 @@ class BaseSimulator:
                 f"Only 'default' is supported in this minimal build."
             )
 
-        try:
-            if self.config.get("INTERFACE", None):
-                ChannelFactoryInitialize(self.config["DOMAIN_ID"], self.config["INTERFACE"])
-            else:
-                ChannelFactoryInitialize(self.config["DOMAIN_ID"])
-        except Exception as e:
-            print(f"Note: Channel factory initialization attempt: {e}")
+        if self.config.get("INTERFACE", None):
+            ChannelFactoryInitialize(self.config["DOMAIN_ID"], self.config["INTERFACE"])
+        else:
+            ChannelFactoryInitialize(self.config["DOMAIN_ID"])
 
         self.init_unitree_bridge()
         self.sim_env.set_unitree_bridge(self.unitree_bridge)
@@ -599,6 +661,7 @@ class BaseSimulator:
         """Main simulation loop"""
         sim_cnt = 0
         ts = time.time()
+        log_metrics = os.environ.get("SONIC_SIM_METRICS") == "1"
 
         try:
             while self._running and (
@@ -608,6 +671,17 @@ class BaseSimulator:
                 step_start = time.monotonic()
 
                 self.sim_env.sim_step()
+                if log_metrics and sim_cnt % round(1 / self.sim_dt) == 0:
+                    qpos = self.sim_env.mj_data.qpos
+                    roll, pitch, yaw = Rotation.from_quat(qpos[[4, 5, 6, 3]]).as_euler("xyz")
+                    print(
+                        f"[SONIC_SIM_METRICS] elapsed={sim_cnt * self.sim_dt:.1f}s "
+                        f"sim_time={self.sim_env.mj_data.time:.1f}s "
+                        f"x={qpos[0]:.3f}m y={qpos[1]:.3f}m height={qpos[2]:.3f}m "
+                        f"roll={roll:.3f} pitch={pitch:.3f} yaw={yaw:.3f} "
+                        f"resets={self.sim_env.safety_reset_count}",
+                        flush=True,
+                    )
                 now = time.time()
                 if now - ts > 1 / 10.0 and self.redis_client is not None:
                     head_pose = self.sim_env.get_head_pose()

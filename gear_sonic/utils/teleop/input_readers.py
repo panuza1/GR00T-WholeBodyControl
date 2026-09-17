@@ -7,11 +7,66 @@ IsaacTeleopReader  -- in-process IsaacTeleop / CloudXR DeviceIO session.
 import logging
 import threading
 import time
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def flatten_byte_multi_array_data(data: Sequence[Any]) -> bytes:
+    """Flatten a ROS2 ByteMultiArray into its raw msgpack payload."""
+    if not data:
+        return b""
+    first = data[0]
+    if isinstance(first, int):
+        return bytes(data)
+    if isinstance(first, (bytes, bytearray, memoryview)):
+        return b"".join(bytes(chunk) for chunk in data)
+    return bytes(data)
+
+
+def decode_msgpack_byte_multi_array(
+    data: Sequence[Any], *, msgpack_module, msgpack_numpy_module
+) -> dict[str, Any]:
+    """Decode a msgpack payload stored in a ROS2 ByteMultiArray."""
+    payload = flatten_byte_multi_array_data(data)
+    if not payload:
+        return {}
+    return msgpack_module.unpackb(
+        payload, raw=False, object_hook=msgpack_numpy_module.decode
+    )
+
+
+def build_body_pose_sample(
+    data: dict[str, Any], *, prev_stamp_ns: int | None = None, fps_ema: float = 0.0
+) -> tuple[dict[str, Any] | None, int, float]:
+    """Convert ROS2 full-body data to the reader sample schema."""
+    positions = data.get("joint_positions") or []
+    orientations = data.get("joint_orientations") or []
+    n = min(len(positions), len(orientations), _NUM_BODY_JOINTS)
+    stamp_ns = int(data.get("timestamp", 0))
+    if n == 0:
+        return None, stamp_ns, fps_ema
+
+    body_poses = np.zeros((_NUM_BODY_JOINTS, 7), dtype=np.float32)
+    for idx in range(n):
+        body_poses[idx, :3] = np.asarray(positions[idx], dtype=np.float32)
+        body_poses[idx, 3:] = np.asarray(orientations[idx], dtype=np.float32)
+
+    device_dt = ((stamp_ns - prev_stamp_ns) / 1_000_000_000) if prev_stamp_ns is not None else 0.0
+    if device_dt > 0.0:
+        instant_fps = 1.0 / device_dt
+        fps_ema = instant_fps if fps_ema == 0.0 else 0.9 * fps_ema + 0.1 * instant_fps
+    return {
+        "body_poses_np": body_poses,
+        "timestamp_realtime": time.time(),
+        "timestamp_monotonic": time.monotonic(),
+        "timestamp_ns": stamp_ns,
+        "dt": device_dt,
+        "fps": fps_ema,
+    }, stamp_ns, fps_ema
 
 try:
     import xrobotoolkit_sdk as xrt
@@ -489,5 +544,3 @@ class IsaacTeleopReader:
                 last_report = now
 
             time.sleep(self._period)
-
-

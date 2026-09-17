@@ -64,7 +64,7 @@ public:
 
         if (planner_session_) {
             const auto &input_names = planner_session_->get_input_node_names_str();
-            if (config_.version == 1) {
+            if (config_.version == 1 || config_.version == 2) {
                 if (input_names.size() != 11) {
                     std::cout << "Model version: 1" << std::endl;
                     std::cout << "Model has " << input_names.size() << " inputs, expected 11" << std::endl;
@@ -94,7 +94,7 @@ public:
                 std::string("facing_direction"),
                 std::string("random_seed")
             };
-            if (config_.version == 1) {
+            if (config_.version == 1 || config_.version == 2) {
                 requiredNames.push_back("height");
                 requiredNames.push_back("has_specific_target");
                 requiredNames.push_back("specific_target_positions");
@@ -165,6 +165,7 @@ public:
 
         const auto &input_names = planner_session_->get_input_node_names_str();
         const auto &input_dims = planner_session_->get_input_node_dims();
+        planner_input_tensors_.clear();
         for (size_t i = 0; i < input_names.size(); ++i) {
             const std::string &name = input_names[i];
             if (name == "context_mujoco_qpos") {
@@ -190,13 +191,7 @@ public:
             } else if (name == "allowed_pred_num_tokens") {
                 planner_input_tensors_.push_back(Ort::Value::CreateTensor<int64_t>(allocator_.GetInfo(), allowed_pred_num_tokens_.data(), allowed_pred_num_tokens_.size(), input_dims[i].data(), input_dims[i].size()));
             } else {
-                // Unknown input; create a zero tensor of expected type/shape to satisfy model binding
-                // Default to float tensor
-                std::vector<float> zero;
-                size_t count = 1;
-                for (auto d : input_dims[i]) { if (d > 0) count *= static_cast<size_t>(d); }
-                zero.resize(count, 0.0f);
-                planner_input_tensors_.push_back(Ort::Value::CreateTensor<float>(allocator_.GetInfo(), zero.data(), zero.size(), input_dims[i].data(), input_dims[i].size()));
+                throw std::runtime_error("Unsupported ONNX planner input: " + name);
             }
         }
 
@@ -264,7 +259,7 @@ private:
         
         // Update target velocity
         target_vel_values_[0] = target_vel;
-        if (config_.version == 1) {
+        if (config_.version == 1 || config_.version == 2) {
             target_height_values_[0] = target_height;
         }
         
@@ -307,7 +302,7 @@ private:
                 std::cout << "UNKNOWN";
                 break;
         }
-        if (config_.version == 1) {
+        if (config_.version == 1 || config_.version == 2) {
             std::cout << ", target_height: " << target_height_values_[0];
         }
         std::cout << ", target_vel: " << target_vel_values_[0]

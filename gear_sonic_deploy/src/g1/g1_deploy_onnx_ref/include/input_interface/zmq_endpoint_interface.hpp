@@ -88,7 +88,7 @@
 class ZMQEndpointInterface : public InputInterface {
 public:
     /// Compile-time toggle for debug log output.
-    static constexpr bool DEBUG_LOGGING = true;
+    static constexpr bool DEBUG_LOGGING = false;
     
     // ------------------------------------------------------------------
     // Per-frame action flags (reset at the start of every update() call)
@@ -256,7 +256,9 @@ public:
             reinitialize_heading = true;
             current_motion = motion_reader.GetMotionShared(motion_reader.current_motion_index_);
             current_frame = 0;
-            if (current_motion->GetEncodeMode() >= 0) {
+            if (!current_motion) {
+                operator_state.stop = true;
+            } else if (current_motion->GetEncodeMode() >= 0) {
                 current_motion->SetEncodeMode(0);
             }
         }
@@ -264,7 +266,8 @@ public:
         std::cout << "=====================================" << std::endl;
         std::cout << "ZMQ STREAMING MODE: FORCE DISABLED" << std::endl;
         std::cout << "=====================================" << std::endl;
-        std::cout << "Returned to reference motion. Re-enable ZMQ mode to continue." << std::endl;
+        std::cout << (current_motion ? "Returned to reference motion." : "No reference motion; stop requested.")
+                  << " Re-enable ZMQ mode to continue." << std::endl;
     }
 
     // Handle input and update motion data
@@ -326,7 +329,7 @@ public:
                 }
                 // reset streaming buffers when enabling to avoid mixing with stale data
                 ResetStreamedMotion(); // This also resets protocol version in the merger
-                has_new_data_ = false;
+                stream_start_time_ = std::chrono::steady_clock::now();
             } else {
                 std::cout << "=====================================" << std::endl;
                 std::cout << "ZMQ STREAMING MODE: DISABLED" << std::endl;
@@ -350,7 +353,6 @@ public:
                 }
                 // reset the streamed motion (also resets protocol version)
                 ResetStreamedMotion();
-                has_new_data_ = false;
             }
         }
         if (stop_control) { operator_state.stop = true; }
@@ -414,6 +416,7 @@ public:
                             has_external_token_state_ = true;
                             operator_state.play = true; // this should be redundant because the robot never read reference motion
                         }
+                        last_valid_receive_time_ = std::chrono::steady_clock::now();
                         
                         // Skip motion handling and keyboard controls
                         return;
@@ -430,6 +433,7 @@ public:
                     }
                     
                     if (result.motion) {
+                        last_valid_receive_time_ = std::chrono::steady_clock::now();
                         // Determine encode_mode based on protocol version (only once when first established)
                         // Version 1: Use encoder mode 0 (joint-based)
                         // Version 2/3: Use encoder mode 2 (SMPL-based)
@@ -440,7 +444,9 @@ public:
                     
                         
                         new_motion = result.motion;
-                        std::cout << "[ZMQEndpointInterface] motion name: " << new_motion->name << std::endl;
+                        if constexpr (DEBUG_LOGGING) {
+                            std::cout << "[ZMQEndpointInterface] motion name: " << new_motion->name << std::endl;
+                        }
                         stream_window_start_ = result.window_start;
                         frame_offset_adjustment = result.frame_offset_adjustment;
                         did_catchup = result.did_catchup_reset;
@@ -459,6 +465,17 @@ public:
                         std::cout << "[ZMQEndpointInterface] *** End of ZMQ decoding processing ***" << std::endl;
                     }
                 }
+            }
+
+            // A stalled or malformed stream must not leave the last pose active.
+            if (std::chrono::steady_clock::now() -
+                    last_valid_receive_time_.value_or(stream_start_time_) >
+                std::chrono::seconds(1)) {
+                DisableZmqAndReset(motion_reader, current_motion, current_frame,
+                                   operator_state, reinitialize_heading,
+                                   current_motion_mutex, "ZMQ pose timeout");
+                ResetStreamedMotion();
+                return;
             }
             
             // update streamed_motion_ and current_frame if we have new data
@@ -576,6 +593,7 @@ public:
     }
 
     std::optional<std::chrono::steady_clock::time_point> GetLastUpdateTime() const override {
+      std::lock_guard<std::mutex> lock(data_mutex_);
       if (is_localhost_) {
         return data_timestamp_;
       }
@@ -593,6 +611,10 @@ private:
         streamed_motion_->name = "streamed";
         streamed_motion_->ReserveCapacity(15000, 29, 1, 1, 0, 0); // max 15k frames, 29 joints, 1 body, 1 quat
         stream_window_start_ = 0;
+        last_valid_receive_time_.reset();
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        has_new_data_ = false;
+        buffered_buffers_.clear();
         data_timestamp_.reset();
         last_receive_time_.reset();
     }
@@ -1468,7 +1490,7 @@ private:
             }
             
             // Print frame indices for protocol v3 (SMPL actions)
-            if (protocol_version == 3 && !frame_indices.empty()) {
+            if (DEBUG_LOGGING && protocol_version == 3 && !frame_indices.empty()) {
                 if (frame_indices.size() == 1) {
                     std::cout << "[ZMQEndpointInterface] Protocol v3: Received SMPL action (single) - frame_index: " 
                               << frame_indices[0] << std::endl;
@@ -1809,11 +1831,12 @@ private:
         
         std::lock_guard<std::mutex> lock(data_mutex_);
         
-        // Print message received info
-        std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic 
-                  << "', protocol_version: " << hdr.version 
-                  << ", num_fields: " << hdr.fields.size() 
-                  << ", total_size: " << bufs.size() << " buffers" << std::endl;
+        if constexpr (DEBUG_LOGGING) {
+            std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic
+                      << "', protocol_version: " << hdr.version
+                      << ", num_fields: " << hdr.fields.size()
+                      << ", total_size: " << bufs.size() << " buffers" << std::endl;
+        }
         
         // Buffer the received data for processing in handle_input (main thread)
         buffered_header_ = hdr;
@@ -1857,6 +1880,8 @@ private:
     bool is_localhost_ = true;         ///< True if host_ is localhost (for directly comparing timestamps)
     std::optional<std::chrono::steady_clock::time_point> data_timestamp_{};  ///< Timestamp of last received message from XR source
     std::optional<std::chrono::steady_clock::time_point> last_receive_time_{}; ///< Timestamp of last OnPoseDataReceived (ms, monotonic).
+    std::optional<std::chrono::steady_clock::time_point> last_valid_receive_time_{};
+    std::chrono::steady_clock::time_point stream_start_time_{};
     uint64_t receive_count_ = 0;       ///< Total number of messages received.
     uint64_t last_decode_time_ = 0;    ///< Timestamp of last DecodeIntoMotionSequence call (ms).
     

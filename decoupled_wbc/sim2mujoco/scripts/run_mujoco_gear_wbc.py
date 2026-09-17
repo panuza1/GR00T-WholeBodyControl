@@ -112,7 +112,7 @@ class GearWbcController:
             config = yaml.safe_load(f)
 
         for path_key in ["policy_path", "xml_path", "walk_policy_path"]:
-            config[path_key] = os.path.join(CONFIG_PATH, config[path_key])
+            config[path_key] = os.path.join(self.CONFIG_PATH, config[path_key])
 
         array_keys = ["kps", "kds", "default_angles", "cmd_scale", "cmd_init"]
         for key in array_keys:
@@ -245,7 +245,7 @@ class GearWbcController:
         def run_inference(input_tensor):
             ort_inputs = {model.get_inputs()[0].name: input_tensor.cpu().numpy()}
             ort_outs = model.run(None, ort_inputs)
-            return torch.tensor(ort_outs[0], device="cuda:0")
+            return torch.from_numpy(ort_outs[0])
 
         return run_inference
 

@@ -333,6 +333,9 @@ class BaseConfig(ArgsConfigTemplate):
 class SimLoopConfig(BaseConfig):
     """Config for running the simulation loop."""
 
+    dds_domain: int = 0
+    """DDS domain; use 42 for the isolated SONIC_SIM_ORT controller."""
+
     mp_start_method: str = "spawn"
     """Multiprocessing start method"""
 

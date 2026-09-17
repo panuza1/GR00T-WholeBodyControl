@@ -48,7 +48,10 @@
  *   --motor-kd-scale      | Scale selected hardware motor Kd gains
  */
 #include <cmath>
+#include <atomic>
+#ifndef SONIC_SIM_ORT
 #include <cuda_runtime_api.h>
+#endif
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -78,8 +81,10 @@
 #include <unitree/idl/hg/LowState_.hpp>
 #include <unitree/robot/b2/motion_switcher/motion_switcher_client.hpp>
 
-// TRTInference
+#ifndef SONIC_SIM_ORT
+// Production TensorRT backend
 #include <TRTInference/InferenceEngine.h>
+#endif
 
 // ONNX
 #include <onnxruntime_cxx_api.h>
@@ -95,7 +100,11 @@
 
 // New Planner Classes
 #include "../include/localmotion_kplanner.hpp"
+#ifdef SONIC_SIM_ORT
+#include "../include/localmotion_kplanner_onnx.hpp"
+#else
 #include "../include/localmotion_kplanner_tensorrt.hpp"
+#endif
 
 // Utility classes
 #include "../include/utils.hpp"
@@ -124,14 +133,18 @@
 
 #include "../include/output_interface/zmq_output_handler.hpp"
 
+#ifndef SONIC_SIM_ORT
 #include <cuda_runtime.h>
+#endif
 #include "../include/state_logger.hpp"
 
-// Encoder
+// Encoder and control policy
+#ifdef SONIC_SIM_ORT
+#include "../include/ort_sim_engine.hpp"
+#else
 #include "../include/encoder.hpp"
-
-// Control policy
 #include "../include/control_policy.hpp"
+#endif
 
 // Dex3 hands
 #include "../include/dex3_hands.hpp"
@@ -225,6 +238,10 @@ class G1Deploy {
     std::string planner_path;
     std::unique_ptr<LocalMotionPlannerBase> planner_;
     std::shared_ptr<MotionSequence> planner_motion_;
+#ifdef SONIC_SIM_ORT
+    Ort::Env planner_env_{ORT_LOGGING_LEVEL_WARNING, "sonic-sim-planner"};
+    Ort::AllocatorWithDefaultOptions planner_allocator_;
+#endif
     
     // Movement momentum system
     MovementState last_movement_state_ = MovementState(static_cast<int>(LocomotionMode::IDLE), {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, -1.0f, -1.0f);
@@ -251,6 +268,9 @@ class G1Deploy {
     // =========================================================================
     // Flag to disable CRC checking for MuJoCo simulation
     bool disable_crc_check_ = false;
+#ifdef SONIC_SIM_ORT
+    std::atomic<bool> sim_policy_ready_{false};
+#endif
     
     bool reinitialize_heading_ = true;
     bool report_temperature_ = false;
@@ -2215,7 +2235,14 @@ class G1Deploy {
       }
       
       // Initialize ChannelFactory
+#ifdef SONIC_SIM_ORT
+      if (networkInterface != "lo" || !disable_crc_check) {
+        throw std::runtime_error("Simulation ONNX build requires interface lo and --disable-crc-check");
+      }
+      ChannelFactory::Instance()->Init(42, "lo");
+#else
       ChannelFactory::Instance()->Init(0, networkInterface);
+#endif
 
       // Initialize Dex3 hands (ChannelFactory already initialized above)
       dex3_hands_.initialize("");
@@ -2446,7 +2473,11 @@ class G1Deploy {
           std::cout << "Unsupported planner version: " << planner_path << std::endl;
           throw std::runtime_error("Unsupported planner version: " + planner_path);
         }
+#ifdef SONIC_SIM_ORT
+        planner_ = std::make_unique<LocalMotionPlannerONNX>(planner_env_, planner_allocator_, planner_config);
+#else
         planner_ = std::make_unique<LocalMotionPlannerTensorRT>(planner_fp16, 0, planner_config);
+#endif
       }
       
       // Initialize observation function map
@@ -2694,6 +2725,11 @@ class G1Deploy {
     void LowCommandWriter() {
       LowCmd_ dds_low_command;
       dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
+#ifdef SONIC_SIM_ORT
+      // Simulation-only readiness marker: keep physics paused during the
+      // open-loop INIT ramp, then release it after the first policy inference.
+      if (sim_policy_ready_.load()) dds_low_command.mode_pr() = 42;
+#endif
       dds_low_command.mode_machine() = mode_machine_;
 
       const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
@@ -2718,6 +2754,9 @@ class G1Deploy {
     /// Gracefully stop all threads and send a damping-only command.
     void Stop() {
       operator_state.stop = true;
+#ifdef SONIC_SIM_ORT
+      sim_policy_ready_.store(false);
+#endif
 
       if (control_thread_ptr_) {
         input_thread_ptr_->Wait();
@@ -3163,6 +3202,9 @@ class G1Deploy {
       }
       apply_motor_gain_scales(motor_gain_scales_, motor_command_tmp);
       motor_command_buffer_.SetData(motor_command_tmp);
+#ifdef SONIC_SIM_ORT
+      sim_policy_ready_.store(true);
+#endif
       return true;
     }
 
@@ -3428,7 +3470,9 @@ class G1Deploy {
         } else {
           if (current_frame_ >= current_motion_->timesteps - saved_frame_for_observation_window_) {
             current_frame_ = current_frame_ - 1;
-            std::cout << "Motion " << current_motion_->name << " completed and waiting following motion" << std::endl;                    
+            if (current_motion_->name != "streamed") {
+              std::cout << "Motion " << current_motion_->name << " completed and waiting following motion" << std::endl;
+            }
           }
         }
       }
