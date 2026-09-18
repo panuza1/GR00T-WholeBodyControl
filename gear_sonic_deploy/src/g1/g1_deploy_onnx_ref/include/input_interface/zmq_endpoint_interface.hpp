@@ -130,7 +130,7 @@ public:
         const std::string& topic = "pose",
         bool use_conflate = false,
         bool verbose = false
-    ) : InputInterface(), host_(host), port_(port), topic_(topic), verbose_(verbose), is_localhost_(host == LOCALHOST) {
+    ) : InputInterface(), host_(host), port_(port), topic_(topic), verbose_(verbose), is_localhost_(host == LOCALHOST || host == "127.0.0.1" || host == "::1") {
         type_ = InputType::NETWORK;
         
         // Set terminal to non-blocking mode (same as SimpleKeyboard)
