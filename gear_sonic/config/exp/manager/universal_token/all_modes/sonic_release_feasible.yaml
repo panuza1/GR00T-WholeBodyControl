@@ -1,0 +1,13 @@
+# @package _global_
+# Fine-tune the released checkpoint with the deployment-identical action envelope.
+defaults:
+  - sonic_release
+  - override /manager_env/actions: tracking/dynamically_feasible
+  - _self_
+
+exp_var: feasible_finetune
+
+manager_env:
+  config:
+    # The bounded parameterization replaces the wrapper's raw-action clipping.
+    action_clip_value: null

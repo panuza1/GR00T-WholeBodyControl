@@ -69,6 +69,7 @@
 
 #include "input_interface.hpp"
 #include "zmq_packed_message_subscriber.hpp"
+#include "transport_freshness.hpp"
 #include "streamed_motion_merger.hpp"
 
 /**
@@ -1829,6 +1830,11 @@ private:
         const ZMQPackedMessageSubscriber::DecodedHeader& hdr,
         const std::vector<ZMQPackedMessageSubscriber::BufferView>& bufs) {
         
+        if (!freshness_guard_.Accept(hdr, bufs)) {
+            std::cerr << "[ZMQEndpointInterface] Rejected stale/out-of-order pose message" << std::endl;
+            return;
+        }
+
         std::lock_guard<std::mutex> lock(data_mutex_);
         
         if constexpr (DEBUG_LOGGING) {
@@ -1884,6 +1890,7 @@ private:
     std::chrono::steady_clock::time_point stream_start_time_{};
     uint64_t receive_count_ = 0;       ///< Total number of messages received.
     uint64_t last_decode_time_ = 0;    ///< Timestamp of last DecodeIntoMotionSequence call (ms).
+    TransportFreshnessGuard freshness_guard_{};
     
 };
 

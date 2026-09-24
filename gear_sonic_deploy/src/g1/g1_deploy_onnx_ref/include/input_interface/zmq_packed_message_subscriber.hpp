@@ -49,9 +49,11 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <string>
 #include <thread>
 #include <functional>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
 
@@ -147,15 +149,21 @@ class ZMQPackedMessageSubscriber {
         if (dtype == "f32" || dtype == "i32") return 4;
         if (dtype == "i16" || dtype == "f16") return 2;
         if (dtype == "i8" || dtype == "u8" || dtype == "bool") return 1;
-        return 4; // default
+        return 0;
       }
       
       // Compute total byte size for this field
       size_t ComputeByteSize() const {
         if (shape.empty()) return 0;
+        const size_t element_size = GetElementSize();
+        if (element_size == 0) return 0;
         size_t total_elements = 1;
-        for (auto dim : shape) total_elements *= dim;
-        return total_elements * GetElementSize();
+        for (auto dim : shape) {
+          if (dim == 0 || total_elements > std::numeric_limits<size_t>::max() / dim) return 0;
+          total_elements *= dim;
+        }
+        if (total_elements > std::numeric_limits<size_t>::max() / element_size) return 0;
+        return total_elements * element_size;
       }
     };
 
@@ -334,7 +342,7 @@ class ZMQPackedMessageSubscriber {
         size_t offset = 0;
         for (const auto& field : decoded.fields) {
           size_t field_bytes = field.ComputeByteSize();
-          if (offset + field_bytes > data_size) {
+          if (field_bytes == 0 || field_bytes > data_size - offset) {
             if (verbose_) {
               std::cerr << "[ZMQPackedMessageSubscriber] Field " << field.name 
                         << " exceeds data bounds" << std::endl;
@@ -343,6 +351,14 @@ class ZMQPackedMessageSubscriber {
           }
           buffers.push_back(BufferView{data_start + offset, field_bytes});
           offset += field_bytes;
+        }
+
+        if (offset != data_size) {
+          if (verbose_) {
+            std::cerr << "[ZMQPackedMessageSubscriber] Payload has "
+                      << (data_size - offset) << " undeclared trailing bytes" << std::endl;
+          }
+          return false;
         }
 
         if (verbose_) {
@@ -360,6 +376,37 @@ class ZMQPackedMessageSubscriber {
           std::cerr << "[ZMQPackedMessageSubscriber] Receive error: " << e.what() << std::endl;
         }
         Reconnect();
+        return false;
+      }
+    }
+
+    static bool DecodeHeaderJSON(const std::string& header_json, DecodedHeader& out) {
+      try {
+        auto j = nlohmann::json::parse(header_json);
+        if (!j.is_object() || !j.contains("v") || !j.contains("fields") ||
+            !j["fields"].is_array()) return false;
+        out.version = j["v"].get<int>();
+        if (out.version <= 0) return false;
+        out.endian = j.value("endian", "le");
+        if (out.endian != "le" && out.endian != "be") return false;
+        out.count = j.value("count", -1);
+        if (j["fields"].empty() || j["fields"].size() > 128) return false;
+        out.fields.clear();
+        std::unordered_set<std::string> names;
+        for (const auto& f : j["fields"]) {
+          if (!f.is_object() || !f.contains("name") || !f.contains("dtype") ||
+              !f.contains("shape") || !f["shape"].is_array()) return false;
+          FieldInfo fi;
+          fi.name = f["name"].get<std::string>();
+          fi.dtype = f["dtype"].get<std::string>();
+          fi.optional = f.value("optional", false);
+          if (fi.name.empty() || !names.insert(fi.name).second) return false;
+          for (const auto& dim : f["shape"]) fi.shape.push_back(dim.get<size_t>());
+          if (fi.ComputeByteSize() == 0) return false;
+          out.fields.push_back(std::move(fi));
+        }
+        return true;
+      } catch (...) {
         return false;
       }
     }
@@ -390,34 +437,6 @@ class ZMQPackedMessageSubscriber {
       Connect();
     }
 
-    bool DecodeHeaderJSON(const std::string& header_json, DecodedHeader& out) const {
-      try {
-        auto j = nlohmann::json::parse(header_json);
-        if (j.contains("v")) out.version = j["v"].get<int>();
-        if (j.contains("endian")) out.endian = j["endian"].get<std::string>();
-        if (j.contains("count")) out.count = j["count"].get<int>();
-        out.fields.clear();
-        if (j.contains("fields") && j["fields"].is_array()) {
-          for (const auto& f : j["fields"]) {
-            FieldInfo fi;
-            if (f.contains("name")) fi.name = f["name"].get<std::string>();
-            if (f.contains("dtype")) fi.dtype = f["dtype"].get<std::string>();
-            if (f.contains("optional")) fi.optional = f["optional"].get<bool>();
-            fi.shape.clear();
-            if (f.contains("shape") && f["shape"].is_array()) {
-              for (const auto& dim : f["shape"]) {
-                fi.shape.push_back(dim.get<size_t>());
-              }
-            }
-            out.fields.push_back(std::move(fi));
-          }
-        }
-        return true;
-      } catch (...) {
-        return false;
-      }
-    }
-
     std::string host_;
     int port_;
     std::string topic_;
@@ -436,4 +455,3 @@ class ZMQPackedMessageSubscriber {
 };
 
 #endif // ZMQ_PACKED_MESSAGE_SUBSCRIBER_HPP
-

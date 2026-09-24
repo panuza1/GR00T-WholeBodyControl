@@ -56,6 +56,7 @@
 #include "input_command.hpp"
 #include "zmq_endpoint_interface.hpp"
 #include "zmq_packed_message_subscriber.hpp"
+#include "transport_freshness.hpp"
 #include "../localmotion_kplanner.hpp"  // For LocomotionMode enum
 #include "../math_utils.hpp"  // For normalize_vector
 
@@ -587,7 +588,7 @@ class ZMQManager : public InputInterface {
         std::lock_guard<std::mutex> lock(planner_mutex_);
         
         // Check for planner timeout (1 second)
-        constexpr auto PLANNER_TIMEOUT = std::chrono::milliseconds(1000);
+        constexpr auto PLANNER_TIMEOUT = std::chrono::milliseconds(200);
         auto time_since_last_planner = std::chrono::steady_clock::now() - latest_planner_message_.timestamp;
         
         if (latest_planner_message_.valid) {
@@ -681,6 +682,10 @@ class ZMQManager : public InputInterface {
         const std::vector<ZMQPackedMessageSubscriber::BufferView>& bufs) {
       
       if (hdr.fields.empty() || bufs.empty()) return;
+      if (!command_freshness_guard_.Accept(hdr, bufs)) {
+        std::cerr << "[ZMQManager] Rejected stale/out-of-order command message" << std::endl;
+        return;
+      }
       
       int start_idx = -1, stop_idx = -1, planner_idx = -1;
       for (size_t i = 0; i < hdr.fields.size(); ++i) {
@@ -779,6 +784,11 @@ class ZMQManager : public InputInterface {
         const ZMQPackedMessageSubscriber::DecodedHeader& hdr,
         const std::vector<ZMQPackedMessageSubscriber::BufferView>& bufs) {
       
+      if (!planner_freshness_guard_.Accept(hdr, bufs)) {
+        std::cerr << "[ZMQManager] Rejected stale/out-of-order planner message" << std::endl;
+        return;
+      }
+
       int mode_idx = -1, movement_idx = -1, facing_idx = -1;
       int speed_idx = -1, height_idx = -1;
       int upper_body_position_idx = -1, upper_body_velocity_idx = -1;
@@ -1242,6 +1252,8 @@ class ZMQManager : public InputInterface {
     
     std::mutex planner_mutex_;          ///< Guards access to latest_planner_message_.
     PlannerMessage latest_planner_message_;  ///< Most recent planner movement message.
+    TransportFreshnessGuard command_freshness_guard_{};
+    TransportFreshnessGuard planner_freshness_guard_{};
     
     // ------------------------------------------------------------------
     // Per-frame control flags (reset at start of update())

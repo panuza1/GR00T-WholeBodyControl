@@ -1,0 +1,10 @@
+joint_pos:
+  _target_: gear_sonic.envs.manager_env.mdp.actions.DynamicallyFeasibleJointPositionActionCfg
+  asset_name: "robot"
+  joint_names: [".*"]
+  use_default_offset: true
+  control_dt: 0.02
+  position_margin: 0.002
+  max_velocity: 8.0
+  max_acceleration: 80.0
+  dynamic_margin_ratio: 0.05

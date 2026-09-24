@@ -151,6 +151,8 @@
 
 // Error monitor
 #include "../include/error_monitor.hpp"
+#include "../include/dynamic_action_envelope.hpp"
+#include "../include/motor_safety.hpp"
 
 #include "audio_thread/audio_thread.hpp"
 
@@ -268,6 +270,11 @@ class G1Deploy {
     // =========================================================================
     // Flag to disable CRC checking for MuJoCo simulation
     bool disable_crc_check_ = false;
+    bool command_publish_enabled_ = true;
+    bool dynamically_feasible_actions_ = false;
+    DynamicActionEnvelope action_envelope_;
+    MotorSafety motor_safety_;
+    std::chrono::steady_clock::time_point last_motor_rejection_log_{};
 #ifdef SONIC_SIM_ORT
     std::atomic<bool> sim_policy_ready_{false};
 #endif
@@ -2200,7 +2207,9 @@ class G1Deploy {
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
-      MotorGainScaleConfig motor_gain_scales = {})
+      MotorGainScaleConfig motor_gain_scales = {},
+      bool command_publish_enabled = true,
+      bool dynamically_feasible_actions = false)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2211,6 +2220,8 @@ class G1Deploy {
         mode_pr_(Mode::PR),
         mode_machine_(0),
         disable_crc_check_(disable_crc_check),
+        command_publish_enabled_(command_publish_enabled),
+        dynamically_feasible_actions_(dynamically_feasible_actions),
         program_state_(ProgramState::INIT),
         motor_gain_scales_(motor_gain_scales),
         last_action {0.0},
@@ -2244,8 +2255,8 @@ class G1Deploy {
       ChannelFactory::Instance()->Init(0, networkInterface);
 #endif
 
-      // Initialize Dex3 hands (ChannelFactory already initialized above)
-      dex3_hands_.initialize("");
+      // Command peripherals are never initialized in observe/compute-only mode.
+      if (command_publish_enabled_) dex3_hands_.initialize("");
 
       audio_thread_ = std::make_unique<AudioThread>();
 
@@ -2305,18 +2316,22 @@ class G1Deploy {
       planner_motion_->timesteps = 0;
       planner_motion_->name = "planner_motion";
       // try to shutdown motion control-related service
-      msc_ = std::make_unique<unitree::robot::b2::MotionSwitcherClient>();
-      msc_->SetTimeout(5.0f);
-      msc_->Init();
-      std::string form, name;
-      while (msc_->CheckMode(form, name), !name.empty()) {
-        if (msc_->ReleaseMode()) std::cout << "Failed to switch to Release Mode\n";
-        sleep(5);
+      if (command_publish_enabled_) {
+        msc_ = std::make_unique<unitree::robot::b2::MotionSwitcherClient>();
+        msc_->SetTimeout(5.0f);
+        msc_->Init();
+        std::string form, name;
+        while (msc_->CheckMode(form, name), !name.empty()) {
+          if (msc_->ReleaseMode()) std::cout << "Failed to switch to Release Mode\n";
+          sleep(5);
+        }
       }
 
       // create publisher
-      lowcmd_publisher_.reset(new ChannelPublisher<LowCmd_>(HG_CMD_TOPIC));
-      lowcmd_publisher_->InitChannel();
+      if (command_publish_enabled_) {
+        lowcmd_publisher_.reset(new ChannelPublisher<LowCmd_>(HG_CMD_TOPIC));
+        lowcmd_publisher_->InitChannel();
+      }
       // create subscriber
       lowstate_subscriber_.reset(new ChannelSubscriber<LowState_>(HG_STATE_TOPIC));
       lowstate_subscriber_->InitChannel(std::bind(&G1Deploy::LowStateHandler, this, std::placeholders::_1), 1);
@@ -2642,8 +2657,10 @@ class G1Deploy {
 
       // create threads
       input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6, &G1Deploy::Input, this);
-      command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6,
-                                                    &G1Deploy::LowCommandWriter, this);
+      if (command_publish_enabled_) {
+        command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6,
+                                                      &G1Deploy::LowCommandWriter, this);
+      }
       control_thread_ptr_ =
           CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, control_dt_ * 1e6, &G1Deploy::Control, this);
       
@@ -2723,6 +2740,7 @@ class G1Deploy {
      * Also publishes Dex3 hand commands at the same cadence.
      */
     void LowCommandWriter() {
+      if (!command_publish_enabled_ || !lowcmd_publisher_) return;
       LowCmd_ dds_low_command;
       dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
 #ifdef SONIC_SIM_ORT
@@ -2732,15 +2750,29 @@ class G1Deploy {
 #endif
       dds_low_command.mode_machine() = mode_machine_;
 
-      const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
+      const auto buffered_command = motor_command_buffer_.GetDataWithTime();
+      const std::shared_ptr<const MotorCommand> mc = buffered_command.data;
       if (mc) {
+        MotorCommand safe_command = *mc;
+        std::string rejection;
+        const bool valid = motor_safety_.ValidateAndLimit(safe_command, buffered_command.timestamp,
+                                                          std::chrono::steady_clock::now(), rejection);
         for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
           dds_low_command.motor_cmd().at(i).mode() = 1; // 1:Enable, 0:Disable
-          dds_low_command.motor_cmd().at(i).tau() = mc->tau_ff.at(i);
-          dds_low_command.motor_cmd().at(i).q() = mc->q_target.at(i);
-          dds_low_command.motor_cmd().at(i).dq() = mc->dq_target.at(i);
-          dds_low_command.motor_cmd().at(i).kp() = mc->kp.at(i);
-          dds_low_command.motor_cmd().at(i).kd() = mc->kd.at(i);
+          dds_low_command.motor_cmd().at(i).tau() = valid ? safe_command.tau_ff.at(i) : 0.0f;
+          dds_low_command.motor_cmd().at(i).q() = valid ? safe_command.q_target.at(i) : 0.0f;
+          dds_low_command.motor_cmd().at(i).dq() = valid ? safe_command.dq_target.at(i) : 0.0f;
+          dds_low_command.motor_cmd().at(i).kp() = valid ? safe_command.kp.at(i) : 0.0f;
+          dds_low_command.motor_cmd().at(i).kd() = valid ? safe_command.kd.at(i) : 8.0f;
+        }
+        if (!valid) {
+          operator_state.stop = true;
+          const auto now = std::chrono::steady_clock::now();
+          if (last_motor_rejection_log_ == std::chrono::steady_clock::time_point{} ||
+              now - last_motor_rejection_log_ >= std::chrono::seconds(1)) {
+            std::cerr << "[MotorSafety] Rejected command; damping and stopping: " << rejection << std::endl;
+            last_motor_rejection_log_ = now;
+          }
         }
 
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
@@ -2748,7 +2780,7 @@ class G1Deploy {
       }
 
       // Publish Dex3 hand commands at the same publish cadence
-      dex3_hands_.writeOnce();
+      if (!operator_state.stop) dex3_hands_.writeOnce();
     }
 
     /// Gracefully stop all threads and send a damping-only command.
@@ -2763,8 +2795,10 @@ class G1Deploy {
         input_thread_ptr_.reset();
         control_thread_ptr_->Wait();
         control_thread_ptr_.reset();
-        command_writer_ptr_->Wait();
-        command_writer_ptr_.reset();
+        if (command_writer_ptr_) {
+          command_writer_ptr_->Wait();
+          command_writer_ptr_.reset();
+        }
         if (planner_thread_ptr_) {
           planner_thread_ptr_->Wait();
           planner_thread_ptr_.reset();
@@ -3190,11 +3224,20 @@ class G1Deploy {
       auto& action_buffer = policy_engine_->GetActionBuffer();
       float* floatarr = action_buffer.data();
       
+      std::array<double, G1_NUM_MOTOR> raw_action_hardware{};
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        raw_action_hardware[i] = static_cast<double>(floatarr[isaaclab_to_mujoco[i]]);
+      }
+      const auto feasible_target = dynamically_feasible_actions_
+          ? action_envelope_.Transform(raw_action_hardware)
+          : std::array<double, G1_NUM_MOTOR>{};
+
       MotorCommand motor_command_tmp;
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
-        const double action_value = static_cast<double>(floatarr[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
         last_action[i] = static_cast<double>(floatarr[i]);
-        motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i] + action_value);
+        motor_command_tmp.q_target.at(i) = static_cast<float>(dynamically_feasible_actions_
+            ? feasible_target[i]
+            : default_angles[i] + raw_action_hardware[i] * g1_action_scale[i]);
         motor_command_tmp.tau_ff.at(i) = 0.0;
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
@@ -3896,6 +3939,13 @@ class G1Deploy {
             break;
           }
 
+          // The control thread is alive and lowstate is fresh, so refresh the
+          // deliberate standing hold. If this thread stalls, the writer's
+          // independent 100 ms watchdog still rejects the command.
+          if (const auto hold = motor_command_buffer_.GetDataWithTime().data) {
+            motor_command_buffer_.SetData(*hold);
+          }
+
           // Re-publish robot_config so late-joining subscribers can receive it
           // before the policy is activated (ZMQ PUB has no persistence).
           for (auto& oi : output_interfaces_) { if (oi) oi->publish_config(); }
@@ -4212,6 +4262,8 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --planner-motion-logfile <path>: write planner motion to a csv file if provided" << std::endl;
     std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
     std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
+    std::cout << "  --no-command-publish: compute/observe only; never initialize motor or hand publishers" << std::endl;
+    std::cout << "  --dynamically-feasible-actions: use the action definition required by a feasible-policy checkpoint" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
     std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
@@ -4254,6 +4306,8 @@ int main(int argc, char const* argv[]) {
 
   // Parse optional arguments
   bool disableCrcCheck = false;\
+  bool commandPublishEnabled = true;
+  bool dynamicallyFeasibleActions = false;
   std::string obsConfigPath = "";
   std::string encoderFile = "";
   std::string targetMotionLogfile = "";
@@ -4282,6 +4336,12 @@ int main(int argc, char const* argv[]) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
+    } else if (std::string(argv[i]) == "--no-command-publish") {
+      commandPublishEnabled = false;
+      std::cout << "[INFO] Motor and hand command publishing disabled" << std::endl;
+    } else if (std::string(argv[i]) == "--dynamically-feasible-actions") {
+      dynamicallyFeasibleActions = true;
+      std::cout << "[INFO] Dynamically feasible policy action definition enabled" << std::endl;
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -4548,7 +4608,9 @@ int main(int argc, char const* argv[]) {
     enableMotionRecording,
     initial_compliance,
     initial_max_close_ratio,
-    motor_gain_scales
+    motor_gain_scales,
+    commandPublishEnabled,
+    dynamicallyFeasibleActions
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

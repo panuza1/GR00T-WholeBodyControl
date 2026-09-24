@@ -291,31 +291,26 @@ class DefaultEnv:
         body_torques = np.zeros(self.num_body_dof)
         if self.unitree_bridge is not None and self.unitree_bridge.low_cmd:
             for i in range(self.unitree_bridge.num_body_motor):
+                joint_id = self.body_joint_index[i]
                 if self.unitree_bridge.use_sensor:
-                    body_torques[i] = (
-                        self.unitree_bridge.low_cmd.motor_cmd[i].tau
-                        + self.unitree_bridge.low_cmd.motor_cmd[i].kp
-                        * (self.unitree_bridge.low_cmd.motor_cmd[i].q - self.mj_data.sensordata[i])
-                        + self.unitree_bridge.low_cmd.motor_cmd[i].kd
-                        * (
-                            self.unitree_bridge.low_cmd.motor_cmd[i].dq
-                            - self.mj_data.sensordata[i + self.unitree_bridge.num_body_motor]
-                        )
-                    )
+                    q_actual = self.mj_data.sensordata[i]
+                    dq_actual = self.mj_data.sensordata[i + self.unitree_bridge.num_body_motor]
                 else:
-                    body_torques[i] = (
-                        self.unitree_bridge.low_cmd.motor_cmd[i].tau
-                        + self.unitree_bridge.low_cmd.motor_cmd[i].kp
-                        * (
-                            self.unitree_bridge.low_cmd.motor_cmd[i].q
-                            - self.mj_data.qpos[self.body_joint_index[i] + self.qpos_offset - 1]
-                        )
-                        + self.unitree_bridge.low_cmd.motor_cmd[i].kd
-                        * (
-                            self.unitree_bridge.low_cmd.motor_cmd[i].dq
-                            - self.mj_data.qvel[self.body_joint_index[i] + self.qvel_offset - 1]
-                        )
-                    )
+                    q_actual = self.mj_data.qpos[self.body_qpos_index[i]]
+                    dq_actual = self.mj_data.qvel[self.body_qvel_index[i]]
+                q_des = self.unitree_bridge.low_cmd.motor_cmd[i].q
+                if self.mj_model.jnt_limited[joint_id]:
+                    low, high = self.mj_model.jnt_range[joint_id]
+                    q_des = np.clip(q_des, low, high)
+                cmd = self.unitree_bridge.low_cmd.motor_cmd[i]
+                torque = cmd.tau + cmd.kp * (q_des - q_actual) + cmd.kd * (cmd.dq - dq_actual)
+                # Simulation-only guard: do not drive farther into a hard stop.
+                if self.mj_model.jnt_limited[joint_id]:
+                    if q_actual >= high and torque > 0:
+                        torque = 0.0
+                    elif q_actual <= low and torque < 0:
+                        torque = 0.0
+                body_torques[i] = torque
         return body_torques
 
     def get_head_pose(self) -> np.ndarray:
@@ -429,6 +424,18 @@ class DefaultEnv:
             return
         if self.config.get("WAIT_FOR_POLICY_START", False) and not self.unitree_bridge.policy_started:
             return
+        raw_targets = self.compute_body_qpos()
+        for index, (joint_id, target) in enumerate(zip(self.body_joint_index, raw_targets)):
+            if not np.isfinite(target):
+                self._safe_reset(f"non-finite raw target at motor {index}")
+                return
+            if self.mj_model.jnt_limited[joint_id]:
+                low, high = self.mj_model.jnt_range[joint_id]
+                if target < low or target > high:
+                    self._safe_reset(
+                        f"raw target outside joint range at motor {index}: {target:.6f} not in [{low:.6f}, {high:.6f}]"
+                    )
+                    return
         if self.unitree_bridge.joystick:
             self.unitree_bridge.PublishWirelessController()
         if self.elastic_band:

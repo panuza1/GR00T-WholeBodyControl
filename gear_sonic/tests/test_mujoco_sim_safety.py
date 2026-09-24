@@ -61,6 +61,12 @@ def test_g1_order_neutral_and_safety():
     env.sim_step()
     assert env.fall and np.isfinite(data.qpos).all()
 
+    env.unitree_bridge.low_cmd.motor_cmd[0].q = model.jnt_range[env.body_joint_index[0], 1] + 0.01
+    resets = env.safety_reset_count
+    env.sim_step()
+    assert env.fall and env.safety_reset_count == resets + 1
+    assert "raw target outside joint range" in env._last_safety_reset_reason
+
     env.unitree_bridge.low_cmd_received = False
     time_before = data.time
     env.sim_step()

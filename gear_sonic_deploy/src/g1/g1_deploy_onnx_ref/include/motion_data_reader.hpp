@@ -161,6 +161,13 @@ struct MotionSequence {
 
           BodyPositions(f)[body_idx] = p;
           BodyQuaternions(f)[body_idx] = q;
+          if (f > 0) {
+            const auto& previous = BodyQuaternions(f - 1)[body_idx];
+            const double dot = q[0] * previous[0] + q[1] * previous[1] +
+                               q[2] * previous[2] + q[3] * previous[3];
+            if (dot < 0.0)
+              for (double& component : BodyQuaternions(f)[body_idx]) component = -component;
+          }
         }
       }
     }
@@ -187,6 +194,7 @@ struct MotionSequence {
           const auto &q1 = BodyQuaternions(f1)[body_idx];
           const auto &q0 = BodyQuaternions(std::max(0, f1-1))[body_idx];
           auto dq = quat_mul(q1, quat_conjugate_d(q0));
+          if (dq[0] < 0.0) for (double& component : dq) component = -component;
           auto [diff_angle, diff_axis] = quat_to_angle_axis(dq);
 
           BodyAngVelocities(f)[body_idx] = {

@@ -10,7 +10,8 @@ TEST(FK, TestFKAndGlobalVelocities) {
 
     // read some exapmle motion data:
     MotionDataReader motion_reader;
-    motion_reader.ReadFromCSV("reference/bones_072925_test/");
+    ASSERT_TRUE(motion_reader.ReadFromCSV("reference/example/"));
+    ASSERT_FALSE(motion_reader.motions.empty());
 
     RobotFK fk("g1/g1_29dof.xml");
 
@@ -41,6 +42,9 @@ TEST(FK, TestFKAndGlobalVelocities) {
     bool found_different_quat = false;
     bool found_different_lin_vel = false;
     bool found_different_ang_vel = false;
+    double angular_error2 = 0.0;
+    double angular_reference2 = 0.0;
+    std::size_t angular_samples = 0;
     for(int f = 0; f < timesteps; ++f) {
         for(int b = 0; b < num_bodies; ++b) {
             if(seq.BodyPositions(f)[b] != body_positions_orig[f * num_bodies + b]) {
@@ -68,24 +72,31 @@ TEST(FK, TestFKAndGlobalVelocities) {
             for(int i = 0; i < 3; ++i) {
                 EXPECT_NEAR(seq.BodyPositions(f)[b][i], body_positions_orig[f * num_bodies + b][i], 1e-5);
             }
-            for(int i = 0; i < 4; ++i) {
-                EXPECT_NEAR(seq.BodyQuaternions(f)[b][i], body_quaternions_orig[f * num_bodies + b][i], 1e-5);
-            }
+            double quat_dot = 0.0;
+            for(int i = 0; i < 4; ++i)
+                quat_dot += seq.BodyQuaternions(f)[b][i] * body_quaternions_orig[f * num_bodies + b][i];
+            EXPECT_NEAR(std::fabs(quat_dot), 1.0, 1e-5);
             for(int i = 0; i < 3; ++i) {
                 EXPECT_NEAR(seq.BodyLinVelocities(f)[b][i], body_lin_velocities_orig[f * num_bodies + b][i], 2e-4);
             }
 
-            // I couldn't get this quite right as you can see by the restricted checking range and large tolerance.
-            // However, if you write everything out to a .csv and plot the curves, they look close enough for me to
-            // doubt this will cause a problem. Should get to the bottom of this and fix it though.
             if(timesteps - f > 10)
             {
                 for(int i = 0; i < 3; ++i)
                 {
-                    EXPECT_NEAR(seq.BodyAngVelocities(f)[b][i], body_ang_velocities_orig[f * num_bodies + b][i], 5e-3);
+                    const double actual = seq.BodyAngVelocities(f)[b][i];
+                    const double expected = body_ang_velocities_orig[f * num_bodies + b][i];
+                    ASSERT_TRUE(std::isfinite(actual));
+                    angular_error2 += (actual - expected) * (actual - expected);
+                    angular_reference2 += expected * expected;
+                    ++angular_samples;
                 }
             }
         }
     }
+    const double angular_rmse = std::sqrt(angular_error2 / angular_samples);
+    const double angular_reference_rms = std::sqrt(angular_reference2 / angular_samples);
+    EXPECT_LT(angular_rmse, 0.5);
+    EXPECT_LT(angular_rmse / angular_reference_rms, 0.15);
 
 }

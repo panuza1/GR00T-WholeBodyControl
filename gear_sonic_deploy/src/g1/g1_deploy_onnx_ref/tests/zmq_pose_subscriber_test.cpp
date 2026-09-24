@@ -192,5 +192,10 @@ int main(int argc, char** argv)
   std::cout << "==================================" << std::endl;
 
   std::cout << "[Test] Done." << std::endl;
+  if (received_indices.size() < 50 || latencies_ms.size() != received_indices.size()) return 1;
+  if (!std::is_sorted(received_indices.begin(), received_indices.end()) ||
+      std::adjacent_find(received_indices.begin(), received_indices.end()) != received_indices.end()) return 1;
+  if (*std::min_element(latencies_ms.begin(), latencies_ms.end()) < 0.0 ||
+      *std::max_element(latencies_ms.begin(), latencies_ms.end()) > 200.0) return 1;
   return 0;
 }

@@ -46,8 +46,6 @@ list(REMOVE_ITEM PROJECT_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/g1_deploy_onnx_ref
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 if(ENABLE_ASAN)
   message(STATUS "🔬 Building ${EXECUTABLE_NAME} with AddressSanitizer")
-  target_compile_options(${EXECUTABLE_NAME} PRIVATE -fsanitize=address -fno-omit-frame-pointer)
-  target_link_options(${EXECUTABLE_NAME} PRIVATE -fsanitize=address)
 endif()
 
 # Detect architecture and conditionally set CUDA library paths
@@ -201,6 +199,10 @@ endif()
 
 # build the main executable:
 add_executable(${EXECUTABLE_NAME} ${CMAKE_CURRENT_SOURCE_DIR}/src/g1_deploy_onnx_ref.cpp)
+if(ENABLE_ASAN)
+  target_compile_options(${EXECUTABLE_NAME} PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+  target_link_options(${EXECUTABLE_NAME} PRIVATE -fsanitize=address)
+endif()
 if(SONIC_SIM_ORT)
   target_compile_definitions(${EXECUTABLE_NAME} PRIVATE SONIC_SIM_ORT=1)
   target_compile_options(${EXECUTABLE_NAME} PRIVATE -fno-fast-math)
@@ -253,6 +255,11 @@ find_package(GTest REQUIRED)
 file(GLOB_RECURSE TEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/*.cpp)
 
 add_executable(run_tests ${TEST_SRCS})
+target_compile_options(run_tests PRIVATE -fno-fast-math)
+if(ENABLE_ASAN)
+  target_compile_options(run_tests PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+  target_link_options(run_tests PRIVATE -fsanitize=address)
+endif()
 target_link_directories(run_tests PRIVATE ${CUDA_LINK_DIRS})
 target_link_libraries(run_tests GTest::GTest GTest::Main ${EXE_LIBS})
 target_include_directories(run_tests PUBLIC ${EXE_INCLUDES})
