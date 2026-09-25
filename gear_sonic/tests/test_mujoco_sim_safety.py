@@ -64,6 +64,10 @@ def test_g1_order_neutral_and_safety():
     env.unitree_bridge.low_cmd.motor_cmd[0].q = model.jnt_range[env.body_joint_index[0], 1] + 0.01
     resets = env.safety_reset_count
     env.sim_step()
+    assert env.safety_reset_count == resets  # stock simulator accepts raw PD targets
+
+    env.config["STRICT_RAW_TARGET_VALIDATION"] = True
+    env.sim_step()
     assert env.fall and env.safety_reset_count == resets + 1
     assert "raw target outside joint range" in env._last_safety_reset_reason
 

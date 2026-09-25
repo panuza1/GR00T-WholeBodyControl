@@ -19,6 +19,7 @@ FREE_BASE: False
 PRINT_SCENE_INFORMATION: True # Print link, joint and sensors information of robot
 ENABLE_ELASTIC_BAND: False # G1 must stand without external support
 WAIT_FOR_POLICY_START: True # Simulation-only marker from the ORT controller
+STRICT_RAW_TARGET_VALIDATION: False # Keep the official SONIC/MuJoCo action path; opt in only for safety experiments
 
 SIMULATE_DT: 0.005  # Need to be larger than the runtime of viewer.sync()
 VIEWER_DT: 0.02  # Viewer update time

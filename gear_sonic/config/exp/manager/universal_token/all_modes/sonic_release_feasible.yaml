@@ -8,6 +8,9 @@ defaults:
 exp_var: feasible_finetune
 
 manager_env:
+  events:
+    # Deployment uses the nominal offsets; fail parity instead of randomizing them.
+    add_joint_default_pos: null
   config:
     # The bounded parameterization replaces the wrapper's raw-action clipping.
     action_clip_value: null

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
 from gear_sonic.envs.env_utils.g1_action_envelope import (
     CONTROL_DT,
@@ -16,6 +18,7 @@ from gear_sonic.envs.env_utils.g1_action_envelope import (
     G1_JOINT_UPPER,
     MAX_TARGET_ACCELERATION,
     MAX_TARGET_VELOCITY,
+    assert_deployment_action_parity,
     dynamically_feasible_targets,
     tensors_for_joint_names,
 )
@@ -145,10 +148,49 @@ int main() {
 
 
 def test_authoritative_constants_match_deployment_header():
-    header = (
-        Path(__file__).resolve().parents[2]
-        / "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/robot_parameters.hpp"
+    repo = Path(__file__).resolve().parents[2]
+    limits_header = (
+        repo / "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/robot_parameters.hpp"
+    ).read_text()
+    policy_header = (
+        repo / "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/policy_parameters.hpp"
     ).read_text()
     for name in G1_JOINT_NAMES:
-        assert f'"{name}"' in header
+        assert f'"{name}"' in limits_header
+
+    match = re.search(r"isaaclab_to_mujoco\s*=\s*\{([^}]*)\}", policy_header, re.DOTALL)
+    assert match
+    mujoco_to_isaac = [int(value) for value in re.findall(r"\d+", match.group(1))]
+    deployed_isaac_order = [""] * 29
+    for mujoco_index, isaac_index in enumerate(mujoco_to_isaac):
+        deployed_isaac_order[isaac_index] = G1_JOINT_NAMES[mujoco_index]
+    from gear_sonic.envs.env_utils.joint_utils import G1_ISAACLab_ORDER
+
+    assert deployed_isaac_order == G1_ISAACLab_ORDER
     assert len(G1_JOINT_LOWER) == len(G1_JOINT_UPPER) == len(G1_ACTION_SCALE) == 29
+
+
+def test_action_contract_parity_check_is_strict():
+    from gear_sonic.envs.env_utils.joint_utils import G1_ISAACLab_ORDER
+
+    ordered = tensors_for_joint_names(
+        G1_ISAACLab_ORDER, device="cpu", dtype=torch.float64
+    )
+    offset, scale = ordered[2].unsqueeze(0), ordered[3].unsqueeze(0)
+    assert_deployment_action_parity(G1_ISAACLab_ORDER, offset, scale)
+    with pytest.raises(ValueError, match="joint order"):
+        assert_deployment_action_parity(list(G1_JOINT_NAMES), offset, scale)
+    bad_offset = offset.clone()
+    bad_offset[0, 4] += 0.01
+    with pytest.raises(ValueError, match="offsets"):
+        assert_deployment_action_parity(G1_ISAACLab_ORDER, bad_offset, scale)
+    bad_scale = scale.clone()
+    bad_scale[0, 4] += 0.01
+    with pytest.raises(ValueError, match="scales"):
+        assert_deployment_action_parity(G1_ISAACLab_ORDER, offset, bad_scale)
+
+    config = yaml.safe_load(
+        (Path(__file__).resolve().parents[1]
+         / "config/exp/manager/universal_token/all_modes/sonic_release_feasible.yaml").read_text()
+    )
+    assert config["manager_env"]["events"]["add_joint_default_pos"] is None

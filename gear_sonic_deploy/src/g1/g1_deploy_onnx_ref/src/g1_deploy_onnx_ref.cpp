@@ -271,6 +271,7 @@ class G1Deploy {
     // Flag to disable CRC checking for MuJoCo simulation
     bool disable_crc_check_ = false;
     bool command_publish_enabled_ = true;
+    bool hand_publish_enabled_ = true;
     bool dynamically_feasible_actions_ = false;
     DynamicActionEnvelope action_envelope_;
     MotorSafety motor_safety_;
@@ -2209,7 +2210,8 @@ class G1Deploy {
       double initial_max_close_ratio = 1.0,
       MotorGainScaleConfig motor_gain_scales = {},
       bool command_publish_enabled = true,
-      bool dynamically_feasible_actions = false)
+      bool dynamically_feasible_actions = false,
+      bool hand_publish_enabled = true)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2221,6 +2223,7 @@ class G1Deploy {
         mode_machine_(0),
         disable_crc_check_(disable_crc_check),
         command_publish_enabled_(command_publish_enabled),
+        hand_publish_enabled_(hand_publish_enabled),
         dynamically_feasible_actions_(dynamically_feasible_actions),
         program_state_(ProgramState::INIT),
         motor_gain_scales_(motor_gain_scales),
@@ -2256,7 +2259,7 @@ class G1Deploy {
 #endif
 
       // Command peripherals are never initialized in observe/compute-only mode.
-      if (command_publish_enabled_) dex3_hands_.initialize("");
+      if (command_publish_enabled_ && hand_publish_enabled_) dex3_hands_.initialize("");
 
       audio_thread_ = std::make_unique<AudioThread>();
 
@@ -2757,20 +2760,35 @@ class G1Deploy {
         std::string rejection;
         const bool valid = motor_safety_.ValidateAndLimit(safe_command, buffered_command.timestamp,
                                                           std::chrono::steady_clock::now(), rejection);
+#ifdef SONIC_SIM_ORT
+        // The isolated simulator is the stock-policy baseline: audit the
+        // additional safety contract without changing SONIC's published action.
+        const MotorCommand& published_command = *mc;
+        const bool publish_valid = true;
+#else
+        const MotorCommand& published_command = safe_command;
+        const bool publish_valid = valid;
+#endif
         for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
           dds_low_command.motor_cmd().at(i).mode() = 1; // 1:Enable, 0:Disable
-          dds_low_command.motor_cmd().at(i).tau() = valid ? safe_command.tau_ff.at(i) : 0.0f;
-          dds_low_command.motor_cmd().at(i).q() = valid ? safe_command.q_target.at(i) : 0.0f;
-          dds_low_command.motor_cmd().at(i).dq() = valid ? safe_command.dq_target.at(i) : 0.0f;
-          dds_low_command.motor_cmd().at(i).kp() = valid ? safe_command.kp.at(i) : 0.0f;
-          dds_low_command.motor_cmd().at(i).kd() = valid ? safe_command.kd.at(i) : 8.0f;
+          dds_low_command.motor_cmd().at(i).tau() = publish_valid ? published_command.tau_ff.at(i) : 0.0f;
+          dds_low_command.motor_cmd().at(i).q() = publish_valid ? published_command.q_target.at(i) : 0.0f;
+          dds_low_command.motor_cmd().at(i).dq() = publish_valid ? published_command.dq_target.at(i) : 0.0f;
+          dds_low_command.motor_cmd().at(i).kp() = publish_valid ? published_command.kp.at(i) : 0.0f;
+          dds_low_command.motor_cmd().at(i).kd() = publish_valid ? published_command.kd.at(i) : 8.0f;
         }
         if (!valid) {
+#ifndef SONIC_SIM_ORT
           operator_state.stop = true;
+#endif
           const auto now = std::chrono::steady_clock::now();
           if (last_motor_rejection_log_ == std::chrono::steady_clock::time_point{} ||
               now - last_motor_rejection_log_ >= std::chrono::seconds(1)) {
+#ifdef SONIC_SIM_ORT
+            std::cerr << "[MotorSafety][observe-only] Stock command discrepancy: " << rejection << std::endl;
+#else
             std::cerr << "[MotorSafety] Rejected command; damping and stopping: " << rejection << std::endl;
+#endif
             last_motor_rejection_log_ = now;
           }
         }
@@ -2780,7 +2798,7 @@ class G1Deploy {
       }
 
       // Publish Dex3 hand commands at the same publish cadence
-      if (!operator_state.stop) dex3_hands_.writeOnce();
+      if (hand_publish_enabled_ && !operator_state.stop) dex3_hands_.writeOnce();
     }
 
     /// Gracefully stop all threads and send a damping-only command.
@@ -4264,6 +4282,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
     std::cout << "  --no-command-publish: compute/observe only; never initialize motor or hand publishers" << std::endl;
     std::cout << "  --dynamically-feasible-actions: use the action definition required by a feasible-policy checkpoint" << std::endl;
+    std::cout << "  --no-hand-publish: publish body motor commands with Dex3 hand DDS disabled" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
     std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
@@ -4308,6 +4327,7 @@ int main(int argc, char const* argv[]) {
   bool disableCrcCheck = false;\
   bool commandPublishEnabled = true;
   bool dynamicallyFeasibleActions = false;
+  bool handPublishEnabled = true;
   std::string obsConfigPath = "";
   std::string encoderFile = "";
   std::string targetMotionLogfile = "";
@@ -4338,10 +4358,14 @@ int main(int argc, char const* argv[]) {
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
     } else if (std::string(argv[i]) == "--no-command-publish") {
       commandPublishEnabled = false;
+      handPublishEnabled = false;
       std::cout << "[INFO] Motor and hand command publishing disabled" << std::endl;
     } else if (std::string(argv[i]) == "--dynamically-feasible-actions") {
       dynamicallyFeasibleActions = true;
       std::cout << "[INFO] Dynamically feasible policy action definition enabled" << std::endl;
+    } else if (std::string(argv[i]) == "--no-hand-publish") {
+      handPublishEnabled = false;
+      std::cout << "[INFO] Dex3 hand command publishing disabled" << std::endl;
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -4610,7 +4634,8 @@ int main(int argc, char const* argv[]) {
     initial_max_close_ratio,
     motor_gain_scales,
     commandPublishEnabled,
-    dynamicallyFeasibleActions
+    dynamicallyFeasibleActions,
+    handPublishEnabled
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

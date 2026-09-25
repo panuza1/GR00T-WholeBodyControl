@@ -63,6 +63,8 @@ class DefaultEnv:
         self.elastic_band = None
         self._last_safety_reset_reason = None
         self.safety_reset_count = 0
+        self.max_body_command_delta = 0.0
+        self.max_body_joint_delta = 0.0
 
         self.init_scene()
         self.last_reward = 0
@@ -289,6 +291,7 @@ class DefaultEnv:
     def compute_body_torques(self) -> np.ndarray:
         # PD control: tau = tau_ff + kp * (q_des - q) + kd * (dq_des - dq)
         body_torques = np.zeros(self.num_body_dof)
+        strict_targets = self.config.get("STRICT_RAW_TARGET_VALIDATION", False)
         if self.unitree_bridge is not None and self.unitree_bridge.low_cmd:
             for i in range(self.unitree_bridge.num_body_motor):
                 joint_id = self.body_joint_index[i]
@@ -299,13 +302,13 @@ class DefaultEnv:
                     q_actual = self.mj_data.qpos[self.body_qpos_index[i]]
                     dq_actual = self.mj_data.qvel[self.body_qvel_index[i]]
                 q_des = self.unitree_bridge.low_cmd.motor_cmd[i].q
-                if self.mj_model.jnt_limited[joint_id]:
+                if strict_targets and self.mj_model.jnt_limited[joint_id]:
                     low, high = self.mj_model.jnt_range[joint_id]
                     q_des = np.clip(q_des, low, high)
                 cmd = self.unitree_bridge.low_cmd.motor_cmd[i]
                 torque = cmd.tau + cmd.kp * (q_des - q_actual) + cmd.kd * (cmd.dq - dq_actual)
                 # Simulation-only guard: do not drive farther into a hard stop.
-                if self.mj_model.jnt_limited[joint_id]:
+                if strict_targets and self.mj_model.jnt_limited[joint_id]:
                     if q_actual >= high and torque > 0:
                         torque = 0.0
                     elif q_actual <= low and torque < 0:
@@ -425,11 +428,15 @@ class DefaultEnv:
         if self.config.get("WAIT_FOR_POLICY_START", False) and not self.unitree_bridge.policy_started:
             return
         raw_targets = self.compute_body_qpos()
+        defaults = np.asarray(self.robot.DEFAULT_DOF_ANGLES)
+        self.max_body_command_delta = max(
+            self.max_body_command_delta, float(np.max(np.abs(raw_targets - defaults)))
+        )
         for index, (joint_id, target) in enumerate(zip(self.body_joint_index, raw_targets)):
             if not np.isfinite(target):
                 self._safe_reset(f"non-finite raw target at motor {index}")
                 return
-            if self.mj_model.jnt_limited[joint_id]:
+            if self.config.get("STRICT_RAW_TARGET_VALIDATION", False) and self.mj_model.jnt_limited[joint_id]:
                 low, high = self.mj_model.jnt_range[joint_id]
                 if target < low or target > high:
                     self._safe_reset(
@@ -478,6 +485,10 @@ class DefaultEnv:
         else:
             self.mj_data.ctrl = self.torques
         mujoco.mj_step(self.mj_model, self.mj_data)
+        self.max_body_joint_delta = max(
+            self.max_body_joint_delta,
+            float(np.max(np.abs(self.mj_data.qpos[self.body_qpos_index] - defaults))),
+        )
 
         self.check_fall()
 
@@ -686,7 +697,10 @@ class BaseSimulator:
                         f"sim_time={self.sim_env.mj_data.time:.1f}s "
                         f"x={qpos[0]:.3f}m y={qpos[1]:.3f}m height={qpos[2]:.3f}m "
                         f"roll={roll:.3f} pitch={pitch:.3f} yaw={yaw:.3f} "
-                        f"resets={self.sim_env.safety_reset_count}",
+                        f"resets={self.sim_env.safety_reset_count} "
+                        f"max_cmd_delta={self.sim_env.max_body_command_delta:.4f}rad "
+                        f"max_joint_delta={self.sim_env.max_body_joint_delta:.4f}rad "
+                        f"hand_cmds={int(self.unitree_bridge.left_hand_cmd_received or self.unitree_bridge.right_hand_cmd_received)}",
                         flush=True,
                     )
                 now = time.time()

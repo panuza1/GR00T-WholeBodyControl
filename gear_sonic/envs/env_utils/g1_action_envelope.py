@@ -11,6 +11,8 @@ import math
 
 import torch
 
+from gear_sonic.envs.env_utils.joint_utils import G1_ISAACLab_ORDER
+
 
 G1_JOINT_NAMES = (
     "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
@@ -83,6 +85,26 @@ def tensors_for_joint_names(names: list[str], *, device, dtype) -> tuple[torch.T
     indices = [G1_JOINT_NAMES.index(name) for name in names]
     values = (G1_JOINT_LOWER, G1_JOINT_UPPER, G1_DEFAULT_ANGLES, G1_ACTION_SCALE)
     return tuple(torch.tensor([value[i] for i in indices], device=device, dtype=dtype) for value in values)
+
+
+def assert_deployment_action_parity(
+    names: list[str], offset: torch.Tensor, scale: torch.Tensor
+) -> None:
+    """Fail startup unless IsaacLab's instantiated action contract matches deployment."""
+    if list(names) != G1_ISAACLab_ORDER:
+        raise ValueError("IsaacLab action joint order does not match the deployed SONIC policy order")
+    _, _, expected_offset, expected_scale = tensors_for_joint_names(
+        names, device=offset.device, dtype=offset.dtype
+    )
+    if offset.shape[-1] != 29 or not torch.allclose(
+        offset, expected_offset.expand_as(offset), rtol=1.0e-6, atol=1.0e-7
+    ):
+        raise ValueError("IsaacLab action default offsets do not match deployment")
+    scale_tensor = scale if isinstance(scale, torch.Tensor) else torch.full_like(offset, scale)
+    if scale_tensor.shape[-1] != 29 or not torch.allclose(
+        scale_tensor, expected_scale.expand_as(scale_tensor), rtol=1.0e-6, atol=1.0e-7
+    ):
+        raise ValueError("IsaacLab action scales do not match deployment")
 
 
 def dynamically_feasible_targets(
