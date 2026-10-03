@@ -157,6 +157,14 @@ class ZMQManager : public InputInterface {
       if (planner_subscriber_) planner_subscriber_->Stop();
     }
 
+    bool IsStreamingEnabled() const {
+      return pose_interface_ && pose_interface_->use_zmq_stream.load();
+    }
+
+    std::uint64_t GetPosePacketCount() const {
+      return pose_interface_ ? pose_interface_->GetReceiveCount() : 0;
+    }
+
     void update() override {
       // Reset per-frame flags
       emergency_stop_ = false;
@@ -294,6 +302,12 @@ class ZMQManager : public InputInterface {
       if (active_mode_ == ManagedMode::STREAMED_MOTION && pose_interface_) {
         // In streamed motion mode: update pose interface
         pose_interface_->update();
+        // A pose timeout safely disables the endpoint but does not change this
+        // manager's mode. Honor a later publisher start burst in that same mode.
+        if (!trigger_zmq_toggle && start_control_ && !pose_interface_->use_zmq_stream.load()) {
+          trigger_zmq_toggle = true;
+          std::cout << "[ZMQManager] Re-enabling timed-out pose stream on start" << std::endl;
+        }
         if (trigger_zmq_toggle) {
           pose_interface_->TriggerZMQToggle();
           std::cout << "[ZMQManager] ZMQ streaming enabled" << std::endl;

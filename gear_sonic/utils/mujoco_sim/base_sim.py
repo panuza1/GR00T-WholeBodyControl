@@ -647,7 +647,20 @@ class BaseSimulator:
         else:
             ChannelFactoryInitialize(self.config["DOMAIN_ID"])
 
+        print(
+            f"[SONIC_SIM_DDS] dds_domain={self.config['DOMAIN_ID']} "
+            f"interface={self.config.get('INTERFACE', 'default')} "
+            "lowcmd=rt/lowcmd lowstate=rt/lowstate secondary_imu=rt/secondary_imu",
+            flush=True,
+        )
+
         self.init_unitree_bridge()
+        print(
+            f"[SONIC_SIM_DDS_TYPES] lowcmd={self.unitree_bridge.lowcmd_type_name} "
+            f"lowstate={self.unitree_bridge.lowstate_type_name} "
+            f"secondary_imu={self.unitree_bridge.imu_type_name}",
+            flush=True,
+        )
         self.sim_env.set_unitree_bridge(self.unitree_bridge)
 
         self.init_subscriber()
@@ -680,6 +693,8 @@ class BaseSimulator:
         sim_cnt = 0
         ts = time.time()
         log_metrics = os.environ.get("SONIC_SIM_METRICS") == "1"
+        metrics_started = time.monotonic()
+        next_metrics = metrics_started
 
         try:
             while self._running and (
@@ -689,20 +704,29 @@ class BaseSimulator:
                 step_start = time.monotonic()
 
                 self.sim_env.sim_step()
-                if log_metrics and sim_cnt % round(1 / self.sim_dt) == 0:
+                now_monotonic = time.monotonic()
+                if log_metrics and now_monotonic >= next_metrics:
                     qpos = self.sim_env.mj_data.qpos
                     roll, pitch, yaw = Rotation.from_quat(qpos[[4, 5, 6, 3]]).as_euler("xyz")
+                    lowcmd_received, policy_started, lowcmd_rx_count, received_mode_pr = self.unitree_bridge.lowcmd_diagnostics()
+                    motor_qpos = qpos[self.sim_env.body_qpos_index]
                     print(
-                        f"[SONIC_SIM_METRICS] elapsed={sim_cnt * self.sim_dt:.1f}s "
+                        f"[SONIC_SIM_METRICS] elapsed={now_monotonic - metrics_started:.1f}s "
+                        f"dds_domain={self.config['DOMAIN_ID']} interface={self.config.get('INTERFACE', 'default')} "
+                        f"low_cmd_received={str(lowcmd_received).lower()} policy_started={str(policy_started).lower()} "
+                        f"received_mode_pr={received_mode_pr} lowcmd_rx_count={lowcmd_rx_count} "
                         f"sim_time={self.sim_env.mj_data.time:.1f}s "
                         f"x={qpos[0]:.3f}m y={qpos[1]:.3f}m height={qpos[2]:.3f}m "
                         f"roll={roll:.3f} pitch={pitch:.3f} yaw={yaw:.3f} "
                         f"resets={self.sim_env.safety_reset_count} "
                         f"max_cmd_delta={self.sim_env.max_body_command_delta:.4f}rad "
                         f"max_joint_delta={self.sim_env.max_body_joint_delta:.4f}rad "
+                        f"left_hip_roll_qpos={motor_qpos[1]:.4f} right_hip_roll_qpos={motor_qpos[7]:.4f} "
+                        f"left_shoulder_pitch_qpos={motor_qpos[15]:.4f} right_shoulder_pitch_qpos={motor_qpos[22]:.4f} "
                         f"hand_cmds={int(self.unitree_bridge.left_hand_cmd_received or self.unitree_bridge.right_hand_cmd_received)}",
                         flush=True,
                     )
+                    next_metrics = now_monotonic + 1.0
                 now = time.time()
                 if now - ts > 1 / 10.0 and self.redis_client is not None:
                     head_pose = self.sim_env.get_head_pose()

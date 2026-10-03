@@ -66,6 +66,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <atomic>
 
 #include "input_interface.hpp"
 #include "zmq_packed_message_subscriber.hpp"
@@ -108,7 +109,7 @@ public:
 
     /// When true, handle_input() reads from the ZMQ stream instead of
     /// pre-loaded reference motions.
-    bool use_zmq_stream = false;
+    std::atomic<bool> use_zmq_stream{false};
     
     /// Reusable sliding-window merger that handles frame alignment, gap
     /// detection, and catch-up logic for streamed motion data.
@@ -599,6 +600,11 @@ public:
         return data_timestamp_;
       }
       return last_receive_time_;
+    }
+
+    std::uint64_t GetReceiveCount() const {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      return receive_count_;
     }
     
 private:

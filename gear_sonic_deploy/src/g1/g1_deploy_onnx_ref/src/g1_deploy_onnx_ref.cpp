@@ -362,6 +362,11 @@ class G1Deploy {
     
     // Independent logging counter (not affected by planner buffer cleaning)
     int logging_counter_ = 0;
+    std::atomic<uint64_t> create_policy_calls_{0};
+    std::atomic<uint64_t> policy_infer_success_{0};
+    std::atomic<uint64_t> lowcmd_publish_count_{0};
+    std::atomic<uint8_t> published_mode_pr_{0};
+    std::chrono::steady_clock::time_point diagnostics_last_{};
     TimestampedData<LowState_> used_low_state_data_;
     TimestampedData<IMUState_> used_imu_torso_data_;
 
@@ -2253,8 +2258,13 @@ class G1Deploy {
       if (networkInterface != "lo" || !disable_crc_check) {
         throw std::runtime_error("Simulation ONNX build requires interface lo and --disable-crc-check");
       }
+      std::cout << "[SONIC_BUILD] SONIC_SIM_ORT=yes dds_domain=42 interface=lo"
+                << " lowcmd=rt/lowcmd:unitree_hg::LowCmd_"
+                << " lowstate=rt/lowstate:unitree_hg::LowState_"
+                << " secondary_imu=rt/secondary_imu:unitree_hg::IMUState_" << std::endl;
       ChannelFactory::Instance()->Init(42, "lo");
 #else
+      std::cout << "[SONIC_BUILD] SONIC_SIM_ORT=no dds_domain=0 interface=" << networkInterface << std::endl;
       ChannelFactory::Instance()->Init(0, networkInterface);
 #endif
 
@@ -2340,6 +2350,15 @@ class G1Deploy {
       lowstate_subscriber_->InitChannel(std::bind(&G1Deploy::LowStateHandler, this, std::placeholders::_1), 1);
       imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
       imutorso_subscriber_->InitChannel(std::bind(&G1Deploy::imuTorsoHandler, this, std::placeholders::_1), 1);
+      // Start the streaming subscriber before expensive policy/encoder/planner setup.
+      // PUB/SUB has no replay: a one-shot start command sent during initialization
+      // would otherwise be lost before the input interface subscribes.
+      if (input_type == "zmq_manager") {
+        input_interface_ = std::make_unique<ZMQManager>(
+          zmq_host, zmq_port, zmq_topic, "command", "planner", zmq_conflate, zmq_verbose
+        );
+        std::cout << "Initialized ZMQ manager early (before policy initialization)" << std::endl;
+      }
       // Load motion data
       if (motion_reader_.ReadFromCSV(motion_data_path)) {
         if (!motion_reader_.motions.empty()) {
@@ -2569,9 +2588,13 @@ class G1Deploy {
         std::cout << "  Initial encoder mode: " << initial_encoder_mode_ << std::endl;
       }
       else if (input_type == "zmq_manager") {
-        input_interface_ = std::make_unique<ZMQManager>(
-          zmq_host, zmq_port, zmq_topic, "command", "planner", zmq_conflate, zmq_verbose
-        );
+        // Constructed before expensive model initialization so startup commands
+        // are not lost to the PUB/SUB slow-joiner window.
+        if (!input_interface_) {
+          input_interface_ = std::make_unique<ZMQManager>(
+            zmq_host, zmq_port, zmq_topic, "command", "planner", zmq_conflate, zmq_verbose
+          );
+        }
         std::cout << "Initialized ZMQ manager" << std::endl;
         std::cout << "  Host: " << zmq_host << ":" << zmq_port << std::endl;
         std::cout << "  Pose topic: " << zmq_topic << std::endl;
@@ -2751,6 +2774,7 @@ class G1Deploy {
       // open-loop INIT ramp, then release it after the first policy inference.
       if (sim_policy_ready_.load()) dds_low_command.mode_pr() = 42;
 #endif
+      published_mode_pr_.store(dds_low_command.mode_pr());
       dds_low_command.mode_machine() = mode_machine_;
 
       const auto buffered_command = motor_command_buffer_.GetDataWithTime();
@@ -2795,6 +2819,7 @@ class G1Deploy {
 
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
         lowcmd_publisher_->Write(dds_low_command);
+        ++lowcmd_publish_count_;
       }
 
       // Publish Dex3 hand commands at the same publish cadence
@@ -3226,6 +3251,7 @@ class G1Deploy {
      * (hardware order) using `g1_action_scale` and `default_angles`.
      */
     bool CreatePolicyCommand() {
+      ++create_policy_calls_;
       // Convert double observation to float and populate policy's internal input buffer
       auto& obs_buffer_float = policy_engine_->GetInputBuffer();
       for (size_t i = 0; i < obs_buffer_.size(); i++) { 
@@ -3263,6 +3289,7 @@ class G1Deploy {
       }
       apply_motor_gain_scales(motor_gain_scales_, motor_command_tmp);
       motor_command_buffer_.SetData(motor_command_tmp);
+      ++policy_infer_success_;
 #ifdef SONIC_SIM_ORT
       sim_policy_ready_.store(true);
 #endif
@@ -3937,6 +3964,30 @@ class G1Deploy {
      *    10. Periodic timing log every 50 ticks (~1 s).
      */
     void Control() {
+      const auto diagnostic_now = std::chrono::steady_clock::now();
+      if (diagnostics_last_ == std::chrono::steady_clock::time_point{} ||
+          diagnostic_now - diagnostics_last_ >= std::chrono::seconds(1)) {
+        const char* state = program_state_ == ProgramState::INIT ? "INIT" :
+                            program_state_ == ProgramState::WAIT_FOR_CONTROL ? "WAIT_FOR_CONTROL" : "CONTROL";
+        const auto* zmq_manager = dynamic_cast<const ZMQManager*>(input_interface_.get());
+        const bool streaming = zmq_manager && zmq_manager->IsStreamingEnabled();
+        const auto pose_packets = zmq_manager ? zmq_manager->GetPosePacketCount() : 0;
+#ifdef SONIC_SIM_ORT
+        const char* sim_ready = sim_policy_ready_.load() ? "yes" : "no";
+#else
+        const char* sim_ready = "n/a";
+#endif
+        std::cout << "[SONIC_CTRL_METRICS] program_state=" << state
+                  << " zmq_streaming_enabled=" << (streaming ? "yes" : "no")
+                  << " pose_packets_received=" << pose_packets
+                  << " create_policy_calls=" << create_policy_calls_.load()
+                  << " policy_infer_success=" << policy_infer_success_.load()
+                  << " sim_policy_ready=" << sim_ready
+                  << " lowcmd_publish_count=" << lowcmd_publish_count_.load()
+                  << " published_mode_pr=" << static_cast<unsigned>(published_mode_pr_.load())
+                  << std::endl;
+        diagnostics_last_ = diagnostic_now;
+      }
       if (operator_state.stop) { return; }
 
       switch (program_state_) {
@@ -4258,6 +4309,11 @@ static bool parse_motor_gain_scale_flag(
  */
 int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program starting..." << std::endl;
+#ifdef SONIC_SIM_ORT
+  std::cout << "[SONIC_BUILD] SONIC_SIM_ORT=yes" << std::endl;
+#else
+  std::cout << "[SONIC_BUILD] SONIC_SIM_ORT=no" << std::endl;
+#endif
   if (argc < 4) {
     std::cout << "Usage: " << argv[0] << " <network_interface> <policy_file> <motion_data_path> [OPTIONS]"
               << std::endl;

@@ -58,6 +58,14 @@ class UnitreeSdk2Bridge:
         self.num_body_motor = config["NUM_MOTORS"]
         self.num_hand_motor = config.get("NUM_HAND_MOTORS", 0)
         self.use_sensor = config["USE_SENSOR"]
+        self.low_cmd_lock = threading.Lock()
+        self.left_hand_cmd_lock = threading.Lock()
+        self.right_hand_cmd_lock = threading.Lock()
+        self.lowcmd_rx_count = 0
+        self.received_mode_pr = 0
+        self.lowcmd_type_name = f"{LowCmd_.__module__}.{LowCmd_.__name__}"
+        self.lowstate_type_name = f"{LowState_.__module__}.{LowState_.__name__}"
+        self.imu_type_name = f"{IMUState_.__module__}.{IMUState_.__name__}"
 
         self.have_imu_ = False
         self.have_frame_sensor_ = False
@@ -95,10 +103,6 @@ class UnitreeSdk2Bridge:
         self.right_hand_cmd = HandCmd_default()
         self.right_hand_cmd_suber = ChannelSubscriber("rt/dex3/right/cmd", HandCmd_)
         self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
-
-        self.low_cmd_lock = threading.Lock()
-        self.left_hand_cmd_lock = threading.Lock()
-        self.right_hand_cmd_lock = threading.Lock()
 
         self.wireless_controller = unitree_go_msg_dds__WirelessController_()
         self.wireless_controller_puber = ChannelPublisher(
@@ -146,7 +150,13 @@ class UnitreeSdk2Bridge:
             self.low_cmd = msg
             self.low_cmd_received = True
             self.policy_started = msg.mode_pr == 42
+            self.received_mode_pr = int(msg.mode_pr)
+            self.lowcmd_rx_count += 1
             self.new_low_cmd = True
+
+    def lowcmd_diagnostics(self):
+        with self.low_cmd_lock:
+            return self.low_cmd_received, self.policy_started, self.lowcmd_rx_count, self.received_mode_pr
 
     def LeftHandCmdHandler(self, msg):
         with self.left_hand_cmd_lock:
